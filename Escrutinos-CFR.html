@@ -1,28 +1,598 @@
 <!DOCTYPE html>
-<html>
+<html lang="es">
 <head>
-    <title>Frayle Assembly Voting System</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Asamblea Frayle - Sistema de Votación</title>
+    <!-- Tailwind CSS para el diseño corporativo -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Colores corporativos basados en la identidad del conjunto */
+        :root {
+            --color-rojo: #991b1b;
+            --color-beige: #f4efe6;
+            --color-rojo-hover: #7f1d1d;
+        }
+        body { background-color: var(--color-beige); }
+        .bg-rojo-frayle { background-color: var(--color-rojo); }
+        .text-rojo-frayle { color: var(--color-rojo); }
+        .border-rojo-frayle { border-color: var(--color-rojo); }
+        
+        /* Animaciones suaves */
+        .fade-in { animation: fadeIn 0.3s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        
+        /* Estilos para impresión */
+        @media print {
+            .no-print { display: none !important; }
+        }
+    </style>
 </head>
-<body>
-    <h1>Voting and Attendance System for Assembly 2026</h1>
-    <div id="voting-section">
-        <h2>Vote Here</h2>
-        <form>
-            <label for="vote">Select your option:</label>
-            <select id="vote" name="vote">
-                <option value="yes">Yes</option>
-                <option value="no">No</option>
-            </select>
-            <button type="submit">Submit Vote</button>
-        </form>
+<body class="min-h-screen flex flex-col font-sans text-slate-800">
+
+    <div id="app-root">
+        <!-- Pantalla de carga inicial -->
+        <div class="h-screen flex flex-col items-center justify-center space-y-4">
+            <div class="w-16 h-16 border-4 border-red-800 border-t-transparent rounded-full animate-spin"></div>
+            <p class="text-red-800 font-bold tracking-widest uppercase animate-pulse">Iniciando Sistema Frayle...</p>
+        </div>
     </div>
-    <div id="attendance-section">
-        <h2>Attendance</h2>
-        <form>
-            <label for="attendee-name">Your Name:</label>
-            <input type="text" id="attendee-name" name="attendee-name" required>
-            <button type="submit">Mark Attendance</button>
-        </form>
-    </div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, getDocs, deleteDoc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- CONFIGURACIÓN DE FIREBASE ---
+        // DEBES completar esto con tus datos de la consola de Firebase para producción
+        const firebaseConfig = {
+            apiKey: "",
+            authDomain: "",
+            projectId: "",
+            storageBucket: "",
+            messagingSenderId: "",
+            appId: ""
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = "asamblea-frayle-2025";
+
+        // --- ESTADO GLOBAL ---
+        let state = {
+            activeTab: 'qr',
+            user: null,
+            registrations: [], 
+            votes: {},
+            history: [],
+            attendance: [], 
+            config: {
+                activeQuestion: "",
+                activeQuestionStartTime: null,
+                adminLocation: null,
+                coefficients: {}
+            },
+            distanceWarning: false,
+            warningTimeLeft: 300,
+            isAdmin: false,
+            maxUnits: 212
+        };
+
+        // --- INICIALIZACIÓN ---
+        async function init() {
+            await signInAnonymously(auth);
+            onAuthStateChanged(auth, (u) => {
+                state.user = u;
+                if (u) startListeners();
+            });
+            // Reloj en tiempo real
+            setInterval(() => {
+                const clock = document.getElementById('live-clock');
+                if (clock) clock.innerText = new Date().toLocaleString('es-CO');
+            }, 1000);
+        }
+
+        function startListeners() {
+            // Configuración Global (Preguntas, GPS, Coeficientes)
+            onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'app_config', 'state'), (snap) => {
+                if (snap.exists()) {
+                    const data = snap.data();
+                    state.config = { ...state.config, ...data };
+                    if (data.coefficients && typeof data.coefficients === 'string') {
+                        state.config.coefficients = JSON.parse(data.coefficients);
+                    }
+                }
+                render();
+            });
+
+            // Registro de Quórum (quién está adentro ahora)
+            onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'registrations'), (snap) => {
+                state.registrations = [];
+                snap.forEach(d => state.registrations.push({...d.data(), unitKey: d.id}));
+                render();
+            });
+
+            // Votos de la pregunta activa
+            onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'votes'), (snap) => {
+                state.votes = {};
+                snap.forEach(d => state.votes[d.id] = d.data().option);
+                render();
+            });
+
+            // Historial de actas/votaciones cerradas
+            onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'history'), (snap) => {
+                state.history = [];
+                snap.forEach(d => state.history.push({id: d.id, ...d.data()}));
+                state.history.sort((a,b) => b.timestamp - a.timestamp);
+                render();
+            });
+
+            // Asistencia histórica total (entradas y salidas)
+            onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), (snap) => {
+                state.attendance = [];
+                snap.forEach(d => state.attendance.push({...d.data(), unitKey: d.id}));
+                // Ordenar: Apartamentos primero, luego Locales, luego por número
+                state.attendance.sort((a, b) => {
+                    if (a.type !== b.type) return a.type.localeCompare(b.type);
+                    return parseInt(a.number) - parseInt(b.number);
+                });
+                render();
+            });
+        }
+
+        // --- SISTEMA GPS ---
+        let warningTimer;
+        navigator.geolocation.watchPosition((pos) => {
+            if (!state.config.adminLocation || state.registrations.filter(r => r.uid === state.user?.uid).length === 0) {
+                state.distanceWarning = false;
+                return;
+            }
+            const dist = getDistance(state.config.adminLocation.lat, state.config.adminLocation.lng, pos.coords.latitude, pos.coords.longitude);
+            if (dist > 200) {
+                if (!state.distanceWarning) {
+                    state.distanceWarning = true;
+                    state.warningTimeLeft = 300;
+                    startGpsTimer();
+                }
+            } else {
+                state.distanceWarning = false;
+                clearInterval(warningTimer);
+            }
+            render();
+        }, null, { enableHighAccuracy: true });
+
+        function startGpsTimer() {
+            clearInterval(warningTimer);
+            warningTimer = setInterval(() => {
+                state.warningTimeLeft--;
+                if (state.warningTimeLeft <= 0) {
+                    clearInterval(warningTimer);
+                    autoExit();
+                }
+                render();
+            }, 1000);
+        }
+
+        async function autoExit() {
+            const myUnits = state.registrations.filter(r => r.uid === state.user.uid);
+            for (const u of myUnits) {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'attendance', u.unitKey), { exitTime: Date.now() }, { merge: true });
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registrations', u.unitKey));
+            }
+        }
+
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2-lat1) * Math.PI/180;
+            const dLon = (lon2-lon1) * Math.PI/180;
+            const a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)*Math.sin(dLon/2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        // --- MOTOR DE INTERFAZ ---
+        function render() {
+            const root = document.getElementById('app-root');
+            const myUnits = state.user ? state.registrations.filter(r => r.uid === state.user.uid) : [];
+            const totalUnits = state.registrations.length;
+            const totalCoef = state.registrations.reduce((s, u) => s + (u.coef || 0), 0);
+
+            // Cálculos matemáticos de votación
+            let votedC = 0, votedF = 0;
+            const res = { Si: {c:0, f:0}, No: {c:0, f:0}, Blanco: {c:0, f:0} };
+            Object.entries(state.votes).forEach(([uk, opt]) => {
+                const reg = state.registrations.find(r => r.unitKey === uk);
+                if (reg && res[opt]) {
+                    res[opt].c++;
+                    res[opt].f += reg.coef;
+                    votedC++;
+                    votedF += reg.coef;
+                }
+            });
+            // Abstención = Quórum Total - Votos Emitidos
+            res.Abstencion = { c: Math.max(0, totalUnits - votedC), f: Math.max(0, totalCoef - votedF) };
+
+            root.innerHTML = `
+                <div class="min-h-screen flex flex-col">
+                    ${state.distanceWarning ? `
+                        <div class="bg-red-700 text-white p-3 text-center sticky top-0 z-[60] shadow-xl animate-pulse">
+                            <p class="font-bold text-sm uppercase">⚠️ Fuera de rango GPS</p>
+                            <p class="text-[10px]">Expulsión en ${Math.floor(state.warningTimeLeft/60)}:${(state.warningTimeLeft%60).toString().padStart(2,'0')}</p>
+                        </div>
+                    ` : ''}
+
+                    <!-- Encabezado Corporativo -->
+                    <header class="bg-red-800 text-white p-4 shadow-lg flex justify-between items-center border-b-4 border-red-900">
+                        <div class="flex flex-col">
+                            <h1 class="text-lg md:text-xl font-black leading-tight tracking-tight uppercase">Conjunto Residencial Frayle</h1>
+                            <p class="text-[10px] text-red-100 font-bold opacity-80 uppercase tracking-widest">NIT: 900.788.112-3</p>
+                        </div>
+                        <div class="bg-white p-1 rounded-xl h-14 w-14 flex items-center justify-center shadow-inner overflow-hidden">
+                            <img src="/Logo Frayle.png" class="max-h-full object-contain" onerror="this.src='https://cdn-icons-png.flaticon.com/512/1018/1018321.png'">
+                        </div>
+                    </header>
+
+                    <!-- Navegación -->
+                    <nav class="bg-white shadow-md flex overflow-x-auto border-b sticky top-0 z-50">
+                        ${['qr', 'register', 'quorum', 'vote', 'admin'].map(t => `
+                            <button onclick="window.setTab('${t}')" class="flex-1 py-3 px-2 flex flex-col items-center gap-1 text-[9px] font-black uppercase transition-all ${state.activeTab === t ? 'text-red-800 border-b-4 border-red-800 bg-red-50' : 'text-stone-400 hover:bg-stone-50'}">
+                                <i data-lucide="${{qr:'qr-code', register:'user-plus', quorum:'users', vote:'vote', admin:'shield'}[t]}" class="w-5 h-5"></i>
+                                <span>${{qr:'Acceso', register:'Registro', quorum:'Quórum', vote:'Votos', admin:'Admin'}[t]}</span>
+                            </button>
+                        `).join('')}
+                    </nav>
+
+                    <!-- Contenido Principal -->
+                    <main class="flex-1 p-4 md:p-6 max-w-5xl mx-auto w-full fade-in">
+                        ${renderTabContent(myUnits, totalUnits, totalCoef, res)}
+                    </main>
+
+                    <!-- Pie de Página -->
+                    <footer class="bg-stone-900 text-stone-400 p-6 text-center text-[10px] md:text-xs border-t-4 border-red-800">
+                        <div class="max-w-4xl mx-auto flex flex-col md:flex-row justify-center items-center gap-2 md:gap-6 opacity-60">
+                            <p><strong>Dirección:</strong> Cra 44 #26-31</p>
+                            <p><strong>Teléfono:</strong> +57-3148056886</p>
+                            <p><strong>e-mail:</strong> crfraylepalmira@gmail.com</p>
+                        </div>
+                        <p class="mt-4 text-stone-600 font-bold uppercase tracking-tighter">Asamblea General 2025</p>
+                    </footer>
+                </div>
+            `;
+            lucide.createIcons();
+        }
+
+        window.setTab = (t) => { state.activeTab = t; render(); };
+
+        function renderTabContent(myUnits, totalUnits, totalCoef, res) {
+            switch(state.activeTab) {
+                case 'qr': return `
+                    <div class="flex flex-col items-center py-10 space-y-8 text-center">
+                        <div class="space-y-2">
+                            <h2 class="text-3xl font-black text-stone-800 uppercase tracking-tight">Acceso Digital</h2>
+                            <p class="text-stone-500 text-sm max-w-xs mx-auto">Escanea el código para registrarte y votar desde tu dispositivo móvil.</p>
+                        </div>
+                        <div class="bg-white p-8 rounded-[40px] shadow-2xl border-4 border-red-50 relative">
+                            <img src="https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(window.location.href)}" class="w-56 h-56 opacity-90">
+                            <div class="absolute -bottom-4 left-1/2 -translate-x-1/2 bg-red-800 text-white px-4 py-1 rounded-full text-[10px] font-bold shadow-lg">SCAN ME</div>
+                        </div>
+                        <div class="bg-stone-200/50 text-stone-500 px-6 py-2 rounded-full font-mono text-[9px] border border-stone-200">${window.location.href}</div>
+                    </div>
+                `;
+                case 'register': return `
+                    <div class="grid md:grid-cols-2 gap-8">
+                        <div class="bg-white rounded-3xl shadow-xl border border-stone-200 overflow-hidden">
+                            <div class="bg-red-800 p-5 text-white font-bold flex items-center gap-3"><i data-lucide="user-plus" class="w-6 h-6"></i> Registro de Asistente</div>
+                            <form onsubmit="window.handleRegister(event)" class="p-8 space-y-5">
+                                ${myUnits.length === 0 ? `
+                                    <div class="space-y-1">
+                                        <label class="text-[10px] font-black text-stone-400 uppercase ml-1">Nombre Completo</label>
+                                        <input id="f-name" type="text" class="w-full p-3 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-red-200 transition-all" required>
+                                    </div>
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div class="space-y-1">
+                                            <label class="text-[10px] font-black text-stone-400 uppercase ml-1">Documento</label>
+                                            <input id="f-doc" type="text" class="w-full p-3 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-red-200 transition-all" required>
+                                        </div>
+                                        <div class="space-y-1">
+                                            <label class="text-[10px] font-black text-stone-400 uppercase ml-1">Celular</label>
+                                            <input id="f-phone" type="tel" class="w-full p-3 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-red-200 transition-all" required>
+                                        </div>
+                                    </div>
+                                    <div class="h-px bg-stone-100 my-2"></div>
+                                ` : ''}
+                                <div class="grid grid-cols-2 gap-4">
+                                    <div class="space-y-1">
+                                        <label class="text-[10px] font-black text-stone-400 uppercase ml-1">Tipo Unidad</label>
+                                        <select id="f-type" class="w-full p-3 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-red-200 transition-all">
+                                            <option value="A">Apartamento</option><option value="L">Local</option>
+                                        </select>
+                                    </div>
+                                    <div class="space-y-1">
+                                        <label class="text-[10px] font-black text-stone-400 uppercase ml-1">Número</label>
+                                        <input id="f-num" type="text" placeholder="Ej: 101" class="w-full p-3 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-red-200 transition-all" required>
+                                    </div>
+                                </div>
+                                <div class="space-y-1">
+                                    <label class="text-[10px] font-black text-stone-400 uppercase ml-1">Calidad de Asistencia</label>
+                                    <select id="f-role" class="w-full p-3 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-red-200 transition-all">
+                                        <option value="Propietario">Propietario</option><option value="Apoderado">Apoderado</option>
+                                    </select>
+                                </div>
+                                <button type="submit" class="w-full py-4 bg-red-700 text-white font-black rounded-2xl uppercase tracking-widest hover:bg-red-800 transition-all shadow-lg active:scale-95">Ingresar al Quórum</button>
+                            </form>
+                        </div>
+                        <div class="space-y-6">
+                            <h3 class="font-black text-stone-700 uppercase tracking-tighter text-xl flex items-center gap-2"><i data-lucide="file-signature" class="text-red-700"></i> Mis Unidades (${myUnits.length})</h3>
+                            ${myUnits.length === 0 ? `
+                                <div class="bg-white/50 border-2 border-dashed border-stone-300 p-12 rounded-3xl text-center text-stone-400 font-bold uppercase text-xs tracking-widest">Ninguna unidad registrada en este equipo</div>
+                            ` : myUnits.map(u => `
+                                <div class="bg-white p-5 rounded-3xl border-l-8 border-red-700 shadow-lg flex justify-between items-center animate-in slide-in-from-right-4">
+                                    <div><p class="font-black text-stone-800 text-xl">${u.type}${u.number}</p><p class="text-[10px] text-stone-400 uppercase font-black tracking-widest">${u.role} • Coef: ${u.coef}</p></div>
+                                    <button onclick="window.delReg('${u.unitKey}')" class="bg-red-50 text-red-600 p-3 rounded-2xl hover:bg-red-600 hover:text-white transition-all shadow-sm"><i data-lucide="log-out" class="w-5 h-5"></i></button>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+                case 'quorum': return `
+                    <div class="space-y-10 py-8 text-center max-w-2xl mx-auto">
+                        <div class="space-y-2">
+                            <h2 class="text-4xl font-black text-stone-800 uppercase tracking-tighter">Estado del Quórum</h2>
+                            <p id="live-clock" class="text-red-700 font-black uppercase tracking-widest text-sm bg-white inline-block px-4 py-1 rounded-full shadow-sm">${new Date().toLocaleString()}</p>
+                        </div>
+                        <div class="grid grid-cols-2 gap-6">
+                            <div class="bg-white p-10 rounded-[40px] shadow-2xl border-b-8 border-blue-500">
+                                <p class="text-6xl font-black text-stone-800">${totalUnits}</p>
+                                <p class="text-[10px] font-black text-stone-400 uppercase mt-4 tracking-widest">Unidades Presentes</p>
+                            </div>
+                            <div class="bg-white p-10 rounded-[40px] shadow-2xl border-b-8 border-red-700">
+                                <p class="text-6xl font-black text-stone-800">${totalCoef.toFixed(4)}</p>
+                                <p class="text-[10px] font-black text-stone-400 uppercase mt-4 tracking-widest">Coeficiente Total</p>
+                            </div>
+                        </div>
+                        <div class="bg-red-50/50 p-4 rounded-2xl border border-red-100">
+                            <p class="text-[10px] text-red-800 font-bold uppercase tracking-widest opacity-60">Capacidad para ${state.maxUnits} unidades / 100% de la copropiedad</p>
+                        </div>
+                    </div>
+                `;
+                case 'vote':
+                    if (!state.config.activeQuestion) return `<div class="p-24 text-center opacity-30"><i data-lucide="clock" class="w-20 h-20 mx-auto mb-6 text-stone-300"></i><h3 class="font-black uppercase tracking-widest text-stone-400">Esperando inicio de votación...</h3></div>`;
+                    return `
+                        <div class="grid lg:grid-cols-2 gap-10">
+                            <div class="space-y-8">
+                                <div class="bg-red-800 p-8 rounded-[40px] text-white shadow-2xl relative overflow-hidden">
+                                    <div class="absolute top-0 right-0 p-4 opacity-10"><i data-lucide="vote" class="w-20 h-20"></i></div>
+                                    <p class="text-[10px] font-black text-red-200 uppercase mb-3 tracking-widest">Pregunta de Asamblea</p>
+                                    <h2 class="text-2xl md:text-3xl font-black leading-tight tracking-tight">${state.config.activeQuestion}</h2>
+                                </div>
+                                <div class="space-y-4">
+                                    <h4 class="font-black text-stone-700 uppercase text-xs tracking-widest ml-2">Mis Votos a emitir:</h4>
+                                    ${myUnits.length === 0 ? '<div class="bg-white p-8 rounded-3xl text-center text-stone-400 border-2 border-dashed font-bold uppercase text-[10px] tracking-widest">Debe registrar unidades para votar</div>' : myUnits.map(u => `
+                                        <div class="bg-white p-6 rounded-3xl border shadow-lg animate-in slide-in-from-left-4">
+                                            <div class="flex justify-between items-center mb-5"><span class="font-black text-stone-800 text-lg">${u.type}${u.number}</span> <span class="text-[10px] text-stone-400 font-black uppercase tracking-widest">Coef: ${u.coef}</span></div>
+                                            ${state.votes[u.unitKey] ? `
+                                                <div class="bg-red-50 text-red-800 py-4 text-center rounded-2xl font-black border-2 border-red-100 uppercase text-sm shadow-inner">VOTO REGISTRADO: ${state.votes[u.unitKey]}</div>
+                                            ` : `
+                                                <div class="grid grid-cols-3 gap-3">
+                                                    <button onclick="window.castVote('${u.unitKey}', 'Si')" class="py-4 bg-blue-100 text-blue-900 font-black rounded-2xl hover:bg-blue-600 hover:text-white transition-all shadow-md active:scale-95">SÍ</button>
+                                                    <button onclick="window.castVote('${u.unitKey}', 'No')" class="py-4 bg-red-100 text-red-900 font-black rounded-2xl hover:bg-red-600 hover:text-white transition-all shadow-md active:scale-95">NO</button>
+                                                    <button onclick="window.castVote('${u.unitKey}', 'Blanco')" class="py-4 bg-stone-100 text-stone-600 font-black rounded-2xl hover:bg-stone-500 hover:text-white transition-all shadow-md active:scale-95">BLANCO</button>
+                                                </div>
+                                            `}
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                            <div class="bg-white p-8 rounded-[40px] shadow-2xl border border-stone-100 h-fit sticky top-24">
+                                <h3 class="font-black text-stone-800 border-b-2 border-stone-50 pb-5 mb-8 uppercase text-sm tracking-widest">Escrutinio en Tiempo Real</h3>
+                                ${['Si', 'No', 'Blanco', 'Abstencion'].map(o => {
+                                    const d = res[o];
+                                    const p = totalCoef > 0 ? ((d.f / totalCoef) * 100).toFixed(2) : 0;
+                                    const color = o==='Si' ? 'bg-blue-500' : o==='No' ? 'bg-red-700' : o==='Blanco' ? 'bg-stone-400' : 'bg-purple-600';
+                                    return `
+                                        <div class="mb-8">
+                                            <div class="flex justify-between text-[11px] font-black uppercase text-stone-600 mb-2 tracking-widest"><span>${o==='Abstencion'?'Abstención':o}</span><span>${p}%</span></div>
+                                            <div class="h-4 bg-stone-100 rounded-full overflow-hidden shadow-inner border border-stone-50"><div class="h-full ${color} transition-all duration-1000 ease-out" style="width: ${p}%"></div></div>
+                                            <div class="flex justify-between text-[10px] mt-2 text-stone-400 font-black uppercase tracking-tighter"><span>Votos: ${d.c} unidades</span><span>Peso: ${d.f.toFixed(4)}</span></div>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                    `;
+                case 'admin':
+                    if (!state.isAdmin) return `
+                        <div class="max-w-sm mx-auto py-20 animate-in slide-in-from-bottom-8">
+                            <form onsubmit="window.handleAdminLogin(event)" class="bg-white p-10 rounded-[40px] shadow-2xl border-t-[12px] border-stone-900 space-y-8">
+                                <div class="text-center"><i data-lucide="shield" class="w-14 h-14 mx-auto text-stone-900 mb-4 opacity-10"></i><h2 class="font-black text-stone-800 uppercase tracking-widest text-xl">Administración</h2></div>
+                                <div class="space-y-4">
+                                    <input id="adm-u" type="password" placeholder="Usuario" class="w-full p-4 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-stone-400 transition-all font-bold">
+                                    <input id="adm-p" type="password" placeholder="Contraseña" class="w-full p-4 bg-stone-50 border-2 border-stone-100 rounded-2xl outline-none focus:border-stone-400 transition-all font-bold">
+                                </div>
+                                <button class="w-full py-5 bg-stone-900 text-white font-black rounded-3xl uppercase tracking-widest hover:bg-black transition-all shadow-xl active:scale-95">Acceder al Control</button>
+                            </form>
+                        </div>
+                    `;
+                    return `
+                        <div class="grid md:grid-cols-2 gap-10 py-6">
+                            <div class="bg-white p-10 rounded-[40px] shadow-xl border border-stone-100">
+                                <h3 class="font-black text-stone-800 mb-8 uppercase text-sm tracking-widest flex items-center gap-3 border-b pb-4"><i data-lucide="vote" class="w-6 h-6 text-red-700"></i> Sistema de Votación</h3>
+                                <div class="space-y-6">
+                                    <textarea id="new-q" class="w-full p-5 border-2 border-stone-100 rounded-3xl outline-none focus:border-red-200 transition-all text-lg font-bold" rows="4" placeholder="Escriba la pregunta para la asamblea..."></textarea>
+                                    <button onclick="window.setQuestion()" class="w-full py-5 bg-red-700 text-white font-black rounded-3xl uppercase tracking-widest hover:bg-red-800 shadow-xl transition-all">Publicar Pregunta</button>
+                                    ${state.config.activeQuestion ? `
+                                        <div class="bg-red-50 p-6 rounded-3xl border-2 border-red-100">
+                                            <p class="text-[10px] font-black text-red-800 uppercase mb-3 tracking-widest opacity-60">Pregunta en pantalla:</p>
+                                            <p class="font-bold text-stone-800 text-xl mb-6">${state.config.activeQuestion}</p>
+                                            <button onclick="window.closeQuestion()" class="w-full py-4 bg-stone-900 text-white font-black rounded-2xl uppercase text-xs tracking-widest shadow-lg">Cerrar y Archivar Resultados</button>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            </div>
+                            <div class="space-y-8">
+                                <div class="bg-white p-10 rounded-[40px] shadow-xl border border-stone-100">
+                                    <h3 class="font-black text-stone-800 mb-8 uppercase text-sm tracking-widest flex items-center gap-3 border-b pb-4"><i data-lucide="printer" class="w-6 h-6 text-red-700"></i> Reportes Oficiales</h3>
+                                    <div class="flex flex-col gap-4">
+                                        <button onclick="window.printReport('votes')" class="w-full py-5 border-2 border-red-800 text-red-800 font-black rounded-3xl uppercase text-xs tracking-widest hover:bg-red-50 transition-all">Generar Acta de Votaciones</button>
+                                        <button onclick="window.printReport('attendance')" class="w-full py-5 border-2 border-red-800 text-red-800 font-black rounded-3xl uppercase text-xs tracking-widest hover:bg-red-50 transition-all">Generar Libro de Asistencia</button>
+                                    </div>
+                                </div>
+                                <div class="bg-white p-10 rounded-[40px] shadow-xl border border-stone-100">
+                                    <h3 class="font-black text-stone-800 mb-8 uppercase text-sm tracking-widest flex items-center gap-3 border-b pb-4"><i data-lucide="map-pin" class="w-6 h-6 text-red-700"></i> Seguridad GPS</h3>
+                                    <p class="text-xs text-stone-400 mb-6 font-bold leading-relaxed">Fija tu ubicación actual como el centro de la asamblea. Usuarios fuera del rango de 200m serán alertados.</p>
+                                    <button onclick="window.toggleGps()" class="w-full py-5 ${state.config.adminLocation ? 'bg-red-100 text-red-800 border-red-200' : 'bg-stone-100 text-stone-600 border-stone-200'} border-2 font-black rounded-3xl uppercase text-xs tracking-widest transition-all">
+                                        ${state.config.adminLocation ? 'Desactivar Restricción GPS' : 'Activar Restricción GPS'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+            }
+        }
+
+        // --- HANDLERS ---
+        window.handleRegister = async (e) => {
+            e.preventDefault();
+            const type = document.getElementById('f-type').value;
+            const num = document.getElementById('f-num').value.trim();
+            const role = document.getElementById('f-role').value;
+            const uk = `${type}-${num}`;
+            const baseCoefs = parseCSV(DEFAULT_CSV);
+            const dataUnit = state.config.coefficients[uk] || baseCoefs[uk];
+
+            if (!dataUnit) return alert("Error: La unidad ingresada no existe en la base de datos.");
+            if (state.registrations.find(r => r.unitKey === uk)) return alert("Error: Esta unidad ya se encuentra registrada en el quórum.");
+
+            const name = document.getElementById('f-name')?.value || state.registrations.find(r=>r.uid===state.user.uid)?.name;
+            const docu = document.getElementById('f-doc')?.value || state.registrations.find(r=>r.uid===state.user.uid)?.document;
+            const phon = document.getElementById('f-phone')?.value || state.registrations.find(r=>r.uid===state.user.uid)?.phone;
+
+            const entry = { type, number: num, role, unitKey: uk, coef: dataUnit.coef, location: dataUnit.location, uid: state.user.uid, entryTime: Date.now(), name, document: docu, phone: phon };
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registrations', uk), entry);
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'attendance', uk), { ...entry, exitTime: null }, { merge: true });
+        };
+
+        window.delReg = async (uk) => {
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'attendance', uk), { exitTime: Date.now() }, { merge: true });
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'registrations', uk));
+        };
+
+        window.castVote = async (uk, opt) => { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'votes', uk), { option: opt }); };
+
+        window.handleAdminLogin = (e) => {
+            e.preventDefault();
+            const u = document.getElementById('adm-u').value.trim().toLowerCase();
+            const p = document.getElementById('adm-p').value.trim();
+            // Acepta crf o cfr indiferente de mayúsculas
+            if ((u === 'crf-admin' || u === 'cfr-admin') && p === '386012') { state.isAdmin = true; render(); }
+            else alert("Acceso Denegado: Verifique usuario y contraseña.");
+        };
+
+        window.setQuestion = async () => {
+            const qTxt = document.getElementById('new-q').value.trim();
+            if (!qTxt) return;
+            await setDoc(db, 'artifacts', appId, 'public', 'data', 'app_config', 'state'), { activeQuestion: qTxt, activeQuestionStartTime: Date.now() }, { merge: true });
+        };
+
+        window.closeQuestion = async () => {
+            if (!confirm("¿Desea cerrar la votación y generar el acta histórica?")) return;
+            const totalUnits = state.registrations.length;
+            const totalCoef = state.registrations.reduce((s, u) => s + (u.coef || 0), 0);
+            let vc = 0, vf = 0;
+            const r = { Si: {c:0, f:0}, No: {c:0, f:0}, Blanco: {c:0, f:0} };
+            Object.entries(state.votes).forEach(([uk, opt]) => {
+                const reg = state.registrations.find(r => r.unitKey === uk);
+                if (reg) { r[opt].c++; r[opt].f += reg.coef; vc++; vf += reg.coef; }
+            });
+            r.Abstencion = { c: Math.max(0, totalUnits - vc), f: Math.max(0, totalCoef - vf) };
+
+            const record = { question: state.config.activeQuestion, startTime: state.config.activeQuestionStartTime, endTime: Date.now(), totalPresentUnits: totalUnits, totalPresentCoef: totalCoef, results: r, timestamp: Date.now() };
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'history', Date.now().toString()), record);
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'app_config', 'state'), { activeQuestion: "", activeQuestionStartTime: null }, { merge: true });
+            const vSnap = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'votes'));
+            vSnap.forEach(async d => await deleteDoc(d.ref));
+        };
+
+        window.toggleGps = async () => {
+            if (state.config.adminLocation) { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'app_config', 'state'), { adminLocation: null }, { merge: true }); }
+            else {
+                navigator.geolocation.getCurrentPosition(async (p) => {
+                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'app_config', 'state'), { adminLocation: { lat: p.coords.latitude, lng: p.coords.longitude } }, { merge: true });
+                }, () => alert("Permiso GPS denegado. La restricción requiere su ubicación."));
+            }
+        };
+
+        window.printReport = (type) => {
+            const win = window.open('', '', 'width=900,height=700');
+            const dateStr = new Date().toLocaleString();
+            let html = `<html><head><title>Frayle - Reporte</title>
+            <style>
+                body{font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;padding:40px;color:#333;line-height:1.6;}
+                .header{text-align:center;border-bottom:4px solid #991b1b;padding-bottom:20px;margin-bottom:30px;}
+                h1{margin:0;color:#991b1b;font-size:24px;text-transform:uppercase;}
+                h2{margin:5px 0 0;font-size:12px;color:#666;letter-spacing:2px;}
+                .meta{margin-bottom:20px;font-size:11px;color:#888;text-align:right;}
+                table{width:100%;border-collapse:collapse;margin-top:20px;font-size:12px;}
+                th,td{border:1px solid #ddd;padding:10px;text-align:left;}
+                th{background:#f9f9f9;font-weight:bold;text-transform:uppercase;font-size:10px;}
+                .footer{margin-top:60px;text-align:center;font-size:10px;border-top:1px solid #eee;padding-top:20px;color:#999;}
+                .box{border:1px solid #eee;padding:20px;border-radius:15px;margin-bottom:20px;page-break-inside:avoid;}
+                .res-grid{display:grid;grid-template-cols:repeat(4,1fr);gap:10px;margin-top:15px;text-align:center;}
+                .res-item{background:#f5f5f5;padding:10px;border-radius:8px;}
+                .res-label{font-size:9px;font-weight:bold;display:block;margin-bottom:4px;}
+                .res-val{font-size:14px;font-weight:900;}
+            </style></head><body>
+            <div class="header">
+                <h1>Conjunto Residencial Frayle</h1>
+                <h2>NIT: 900.788.112-3</h2>
+            </div>
+            <div class="meta">Generado el: ${dateStr}</div>
+            <h3>Reporte Oficial de ${type==='votes'?'Votaciones':'Asistencia'}</h3>`;
+            
+            if (type === 'votes') {
+                if(state.history.length === 0) html += "<p>No hay registros de votaciones cerradas.</p>";
+                state.history.forEach((h, idx) => {
+                    html += `<div class="box">
+                        <p style="font-size:10px;font-weight:bold;margin:0;color:#991b1b">ACTA DE VOTACIÓN #${state.history.length - idx}</p>
+                        <h4 style="margin:5px 0 15px">${h.question}</h4>
+                        <div style="font-size:10px;display:flex;gap:20px">
+                            <span>Quórum presente: <strong>${h.totalPresentUnits} ud.</strong></span>
+                            <span>Peso total: <strong>${h.totalPresentCoef.toFixed(4)}</strong></span>
+                        </div>
+                        <div class="res-grid">
+                        ${['Si','No','Blanco','Abstencion'].map(o => {
+                            const res = h.results[o] || {c:0,f:0};
+                            const pct = ((res.f / h.totalPresentCoef)*100).toFixed(2);
+                            return `<div class="res-item"><span class="res-label">${o==='Abstencion'?'Abstención':o}</span><span class="res-val">${pct}%</span><br><span style="font-size:8px">${res.c} votos</span></div>`;
+                        }).join('')}
+                        </div>
+                    </div>`;
+                });
+            } else {
+                html += `<table><thead><tr><th>Unidad</th><th>Participante</th><th>Documento</th><th>Calidad</th><th>Coef.</th><th>Ingreso</th><th>Salida</th></tr></thead><tbody>
+                ${state.attendance.map(a => `<tr><td>${a.type}${a.number}</td><td>${a.name}</td><td>${a.document}</td><td>${a.role}</td><td>${a.coef}</td><td>${new Date(a.entryTime).toLocaleTimeString()}</td><td>${a.exitTime?new Date(a.exitTime).toLocaleTimeString():'PRESENTE'}</td></tr>`).join('')}
+                </tbody></table>`;
+            }
+            html += `<div class="footer">Documento digital generado por el Sistema de Asamblea Frayle<br>Dirección: Cra 44 #26-31 • Tel: +57-3148056886 • e-mail: crfraylepalmira@gmail.com</div>`;
+            win.document.write(html + "</body></html>"); win.document.close(); win.print();
+        };
+
+        const parseCSV = (str) => {
+            const r = {}; const lines = str.trim().split('\n');
+            lines.forEach(l => {
+                const p = l.split(','); if (p.length < 5 || l.includes('Coef.')) return;
+                const t = p[0].trim(), num = p[2].trim(), loc = p[3].trim(), c = parseFloat(p.slice(4).join('.').replace(',','.'));
+                r[`${t}-${num}`] = { type:t, num, location:loc, coef:c };
+            });
+            return r;
+        };
+
+        const DEFAULT_CSV = `Unidad,No.,Identificación,Ubicación,Coef. Corr.\nA,1,101,T1,0.43\nA,2,102,T1,0.53\nA,3,103,T1,0.53\nA,4,104,T1,0.43\nA,5,105,T1,0.48\nA,6,106,T1,0.48\nA,7,107,T2,0.48\nA,8,108,T2,0.48\nA,9,109,T2,0.43\nA,10,110,T2,0.53\nA,11,111,T2,0.53\nA,12,112,T2,0.43\nL,1,001,Local,1.2\nL,2,002,Local,1.5`;
+
+        window.onload = init;
+    </script>
 </body>
 </html>
